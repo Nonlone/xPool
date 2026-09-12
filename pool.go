@@ -23,7 +23,7 @@ var (
 	ErrPoolStopped        = errors.New("pool stopped")
 )
 
-type Future[T any] func(t T)
+type Runnable[T any] func(t T)
 
 type pool[T any] struct {
 	core     int
@@ -31,16 +31,18 @@ type pool[T any] struct {
 	ch       chan T
 	capacity int
 	reject   strategy
-	goTTL    time.Duration
-
+	ttl      time.Duration
+	run      Runnable[T]
+	// inside control
 	stop     atomic.Bool
 	cur      atomic.Int64
-	f        Future[T]
 	mu       sync.Mutex
 	nodeHead *node[T]
+	done     chan struct{}
+	wg       sync.WaitGroup
 }
 
-func NewPool[T any](core, max, capacity int, ttl time.Duration, reject strategy, f Future[T]) (*pool[T], error) {
+func NewRunnable[T any](core, max, capacity int, ttl time.Duration, reject strategy, run Runnable[T]) (*pool[T], error) {
 	if core <= 0 || max <= 0 || capacity <= 0 {
 		return nil, ErrInvalidParams
 	} else if core > max {
@@ -53,16 +55,13 @@ func NewPool[T any](core, max, capacity int, ttl time.Duration, reject strategy,
 		ch:       make(chan T, capacity),
 		capacity: capacity,
 		reject:   reject,
-		f:        f,
-		goTTL:    ttl,
+		run:      run,
+		ttl:      ttl,
+		done:     make(chan struct{}),
 	}
-	// build goroutines
 
-	head := p.newNode(nil)
-	p.nodeHead = head
-	for i := 0; i < p.core-1; i++ {
-		tempNode := p.newNode(nil)
-		p.addNode(tempNode)
+	for i := 0; i < p.core; i++ {
+		p.newNode(nil)
 	}
 
 	return p, nil
@@ -71,44 +70,44 @@ func NewPool[T any](core, max, capacity int, ttl time.Duration, reject strategy,
 func (p *pool[T]) Submit(t T) error {
 	if p.stop.Load() {
 		return ErrPoolStopped
-	} else if p.reject == Block {
+	}
+
+	if p.reject == Block {
 		p.ch <- t
 		return nil
-	} else if p.isFull() {
+	}
+
+	if p.isFull() {
 		if p.reject == Reject {
 			return ErrRejectByPoolIsFull
-		} else {
-			p.f(t)
 		}
+		p.run(t)
+		return nil
 	}
+
+	p.ch <- t
 	return nil
 }
 
 func (p *pool[T]) Stop() []T {
 	p.stop.Store(true)
-	nh := p.nodeHead
-	nodes := make([]*node[T], 0, p.max)
-	for nh != nil {
-		nodes = append(nodes, nh)
-		nh = nh.next
+	close(p.done)
+	p.wg.Wait()
+
+	result := make([]T, 0)
+	for {
+		select {
+		case t := <-p.ch:
+			result = append(result, t)
+		default:
+			return result
+		}
 	}
-	for n := range nodes {
-		nodes[n].isFinish.Store(true)
-	}
-	for p.nodeHead != nil {
-		// wait for all nodes to finish
-	}
-	result := make([]T, 0, p.capacity)
-	for len(p.ch) != 0 {
-		result = append(result, <-p.ch)
-	}
-	return result
 }
 
 func (p *pool[T]) monitor() {
-	if cur := p.cur.Load(); len(p.ch) == p.capacity && cur <= int64(p.max) {
-		node := p.newNode(&p.goTTL)
-		p.addNode(node)
+	if p.cur.Load() < int64(p.max) && len(p.ch) == p.capacity {
+		p.newNode(&p.ttl)
 	}
 }
 
@@ -116,18 +115,17 @@ func (p *pool[T]) isFull() bool {
 	return p.cur.Load() >= int64(p.max) && len(p.ch) >= p.capacity
 }
 
-func (p *pool[T]) addNode(n *node[T]) {
+func (p *pool[T]) addNode(n *node[T]) bool {
 	if n == nil {
-		return
+		return false
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if p.cur.Load() >= int64(p.max) {
-		return
-	} else {
-		p.cur.Add(1)
+		return false
 	}
+	p.cur.Add(1)
 
 	if p.nodeHead == nil {
 		p.nodeHead = n
@@ -136,6 +134,7 @@ func (p *pool[T]) addNode(n *node[T]) {
 		p.nodeHead.prev = n
 		p.nodeHead = n
 	}
+	return true
 }
 
 type node[T any] struct {
@@ -154,8 +153,11 @@ func (p *pool[T]) newNode(d *time.Duration) *node[T] {
 		duration: d,
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	if !p.addNode(n) {
+		return nil
+	}
+
+	p.wg.Add(1)
 	n.run()
 	return n
 }
@@ -174,21 +176,26 @@ func (n *node[T]) remove() {
 		n.p.nodeHead = n.next
 	}
 	n.p.cur.Add(-1)
+	n.p.wg.Done()
 }
 
 func (n *node[T]) run() {
 	go func() {
 		for {
 			select {
+			case <-n.p.done:
+				n.remove()
+				return
 			case t := <-n.p.ch:
 				n.startAt = time.Now()
-				n.p.f(t)
+				n.p.run(t)
 				n.p.monitor()
 			default:
 				if n.isFinish.Load() {
 					n.remove()
 					return
-				} else if n.duration != nil && time.Since(n.startAt) > *n.duration {
+				}
+				if n.duration != nil && time.Since(n.startAt) > *n.duration {
 					n.isFinish.Store(true)
 				}
 			}
