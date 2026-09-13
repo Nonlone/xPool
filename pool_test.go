@@ -356,8 +356,14 @@ func TestTTL_GoroutineExpiry(t *testing.T) {
 	time.Sleep(10 * time.Millisecond) // Let goroutine pick up task
 
 	// Fill channel to trigger monitor (goroutine is idle after processing)
-	for i := 1; i <= 5; i++ {
+	for i := 1; i <= 10; i++ {
 		p.ch <- i
+	}
+
+	// Wait for goroutine to consume some tasks, then ensure channel is full
+	time.Sleep(5 * time.Millisecond)
+	for len(p.ch) < p.capacity {
+		p.ch <- 999
 	}
 
 	p.monitor()
